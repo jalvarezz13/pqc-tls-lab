@@ -30,6 +30,9 @@ sudo chmod -R 777 /opt/pqc-lab
 
 # 🔐 **Phase 2 — Generate PQC Certificates (NIST-named algorithms)**
 
+> **🍎 Apple Silicon (M1 / M2 / M3) note**
+> The OQS images are published only for `linux/amd64`. If you're on an M-series Mac, append `--platform linux/amd64` to every `docker run` and `docker build` command in this guide. Otherwise Docker will either fail with `exec format error` or fall back to slow QEMU emulation.
+
 Enter the OQS OpenSSL container:
 
 ```bash
@@ -45,10 +48,17 @@ cd /certs
 openssl req -x509 -new -newkey mldsa44 -keyout ca_pqc.key -out ca_pqc.crt -nodes -subj "/CN=PQC Lab Root CA" -days 365
 
 # 2. Create hybrid server key + CSR (P-256 + ML-DSA-44)
-openssl req -new -newkey p256_mldsa44 -keyout server.key -out server.csr -nodes -subj "/CN=localhost"
+#    The SAN (subjectAltName) is required by modern TLS clients and silences
+#    Apache's "server certificate does NOT include an ID which matches the server name" warning.
+openssl req -new -newkey p256_mldsa44 -keyout server.key -out server.csr -nodes \
+    -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 
 # 3. Sign the server certificate using our PQC CA
-openssl x509 -req -in server.csr -out server.crt -CA ca_pqc.crt -CAkey ca_pqc.key -CAcreateserial -days 365
+#    `-copy_extensions copy` is required to propagate the SAN from the CSR
+#    into the final certificate (openssl drops CSR extensions by default).
+openssl x509 -req -in server.csr -out server.crt -CA ca_pqc.crt -CAkey ca_pqc.key \
+    -CAcreateserial -days 365 -copy_extensions copy
 ```
 
 Exit with `exit` or `CTRL+D`.
@@ -81,6 +91,10 @@ Create `/opt/pqc-lab/config/pqc.conf`:
 ```apache
 Listen 4433
 
+SSLProtocol -all +TLSv1.3
+SSLSessionCache "shmcb:/opt/httpd/logs/ssl_scache(512000)"
+SSLSessionCacheTimeout 300
+
 <VirtualHost *:4433>
     ServerName localhost
     DocumentRoot "/opt/httpd/htdocs"
@@ -97,6 +111,9 @@ Listen 4433
 </VirtualHost>
 ```
 
+> **ℹ️ Why these global directives?**
+> `SSLSessionCache` is **required** by Apache to start when SSL is enabled — omitting it makes httpd refuse to launch. `SSLProtocol -all +TLSv1.3` makes the lab deterministic: only TLS 1.3 negotiates PQC algorithms, so we explicitly disable everything else.
+
 # 🚀 **Phase 4 — Build & Run the PQC Apache Server**
 
 Create `/opt/pqc-lab/Dockerfile`:
@@ -106,11 +123,13 @@ FROM openquantumsafe/httpd:latest
 
 USER root
 
-# Copy minimal configuration
-COPY config/pqc.conf /opt/httpd/conf/pqc.conf
-RUN echo "Include /opt/httpd/conf/pqc.conf" >> /opt/httpd/conf/httpd.conf
+# Override the image's default SSL config with ours.
+# The OQS image starts httpd with `-f httpd-conf/httpd.conf`, which
+# includes `httpd-conf/httpd-ssl.conf`. Replacing that file is the
+# cleanest way to make our vhost the active one without leaving the
+# default vhost behind on the same port.
+COPY config/pqc.conf /opt/httpd/httpd-conf/httpd-ssl.conf
 
-# Prepare directories & permissions
 RUN mkdir -p /opt/httpd/logs /opt/httpd/htdocs && chown -R daemon:daemon /opt/httpd/htdocs /opt/httpd/logs
 
 USER daemon
